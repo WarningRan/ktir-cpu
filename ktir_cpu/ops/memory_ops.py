@@ -304,6 +304,12 @@ class MemoryOps:
         to those local coordinates via a read-modify-write on the allocation.
         When *coords* is None, stores the full tile (contiguous or strided).
 
+        Source data layout: ``tile.data`` is read in C-order via
+        ``numpy.ndarray.flatten()``, which always returns a contiguous copy.
+        Non-contiguous source arrays are handled internally — callers do not
+        need to pre-``ascontiguousarray`` the tile. When *coords* is supplied,
+        ``coords[i]`` receives the i-th element of ``tile.data`` in C-order.
+
         A single ``mem.read`` + ``mem.write`` covers the entire footprint;
         no per-element dict scans occur.
 
@@ -731,12 +737,4 @@ class MemoryOps:
                     coord.append(raw_idx)
             coords.append(tuple(coord))
 
-        # Make the C-order contract with MemoryOps.store explicit; no-op when
-        # the source is already contiguous.
-        src_data = np.ascontiguousarray(tile.data)
-        if src_data is not tile.data:
-            src_tile = Tile(src_data, tile.dtype, tile.shape, tile.unique_sticks)
-        else:
-            src_tile = tile
-
-        MemoryOps.store(context, src_tile, iat.parent_ref.to_tile_ref(), coords=coords)
+        MemoryOps.store(context, tile, iat.parent_ref.to_tile_ref(), coords=coords)
