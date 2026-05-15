@@ -439,3 +439,36 @@ def test_small_indirect_scatter_collision():
             if (r, c) == (0, 0):
                 continue
             assert y_data[r, c] == -1.0, f"Y[{r},{c}] = {y_data[r, c]}, expected -1"
+
+
+# ---------------------------------------------------------------------------
+# Negative-index guard (covers both indirect_load and indirect_store)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "mlir,func_name",
+    [
+        (SMALL_INDIRECT_MLIR, "small_indirect_gather"),
+        (SMALL_INDIRECT_SCATTER_MLIR, "small_indirect_scatter"),
+    ],
+    ids=["indirect_load", "indirect_store"],
+)
+def test_negative_indirect_index_raises(mlir, func_name):
+    """A negative entry in the index tensor must raise IndexError, not silently wrap."""
+    interp = KTIRInterpreter()
+    interp.load(mlir)
+
+    _orig = interp._prepare_execution
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        hbm = interp.memory.hbm
+        hbm.write(0, np.zeros(16, dtype=np.float16))
+        idx1 = np.zeros(16, dtype=np.int32)
+        idx1[0] = -1
+        hbm.write(1, idx1)
+        hbm.write(2, np.zeros(16, dtype=np.int32))
+        hbm.write(3, np.zeros(16, dtype=np.float16))
+    interp._prepare_execution = _prepare_and_seed
+
+    with pytest.raises(IndexError, match="is negative"):
+        interp.execute_function(func_name)
