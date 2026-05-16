@@ -163,7 +163,8 @@ def ktdp__store(op, context, env):
     assert isinstance(value, Tile), f"ktdp.store expects a Tile, got {type(value)}"
     access_tile = context.get_value(op.operands[1])
     if isinstance(access_tile, IndirectAccessTile):
-        raise NotImplementedError("ktdp.store with IndirectAccessTile is not yet supported")
+        MemoryOps.indirect_store(context, value, access_tile)
+        return None
     if isinstance(access_tile.parent_ref, DistributedTileRef):
         MemoryOps.distributed_store(context, value, access_tile.parent_ref)
         return None
