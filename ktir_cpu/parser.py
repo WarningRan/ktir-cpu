@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 from .ir_types import Operation, IRFunction, IRModule
 from .dialects import dispatch_parser, make_parse_context, ParseContext
 from .parser_utils import parse_attr_block, parse_tensor_type, parse_numeric
+from .parser_utils import find_ssa_names
 
 
 class KTIRParserBase(ABC):
@@ -602,7 +603,7 @@ class KTIRParser(KTIRParserBase):
         # attribute blocks.
         cleaned = re.sub(r'\{[^}]*\}', '', text)
 
-        operands = re.findall(r'%\w+', cleaned)
+        operands = find_ssa_names(cleaned)
 
         # Remove result name if present
         if result:
