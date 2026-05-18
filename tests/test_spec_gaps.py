@@ -90,8 +90,10 @@ def test_paged_tensor_indirect_access(path, func_name, entry):
     """
     interp = KTIRInterpreter()
     interp.load(path)
-    # Read seed addresses from the parsed IR so the test tracks the .mlir if
-    # its arith.constant values change.
+    # Build a name→value map of every arith.constant in the function so we can
+    # look up addresses by their SSA name (e.g. %Idx_start_address) instead of
+    # hardcoding the literal integers.  If the .mlir changes the address values,
+    # the test automatically picks them up.
     func = interp.module.get_function(func_name)
     addrs = {
         op.result.lstrip("%"): op.attributes["value"]
@@ -102,10 +104,10 @@ def test_paged_tensor_indirect_access(path, func_name, entry):
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
         hbm = interp.memory.hbm
-        # Idx tensor: shape 4x32 i32, all zeros → every page ID = 0
+        # Idx tensor (4×32 i32): all zeros so every indirect page ID resolves to 0.
         hbm.write(addrs["Idx_start_address"], np.zeros(4 * 32, dtype=np.int32))
-        # X tensor: seed page 0 only (65536 f16 elements). All accesses land
-        # on page 0 because Idx is all zeros.
+        # X tensor: only page 0 needs data (65 536 f16 elements = one page).
+        # Because Idx is all zeros every gather access lands on page 0.
         hbm.write(addrs["X_start_address"], np.zeros(65536, dtype=np.float16))
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name)
