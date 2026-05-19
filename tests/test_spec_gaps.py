@@ -104,11 +104,13 @@ def test_paged_tensor_indirect_access(path, func_name, entry):
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
         hbm = interp.memory.hbm
-        # Idx tensor (4×32 i32): all zeros so every indirect page ID resolves to 0.
-        hbm.write(addrs["Idx_start_address"], np.zeros(4 * 32, dtype=np.int32))
-        # X tensor: only page 0 needs data (65 536 f16 elements = one page).
+        # Idx tensor (Nb × Ntkv/Ptkv i32): all zeros so every indirect page ID resolves to 0.
+        idx_n_elements = addrs["Nb"] * (addrs["Ntkv"] // addrs["Ptkv"])
+        hbm.write(addrs["Idx_start_address"], np.zeros(idx_n_elements, dtype=np.int32))
+        # X tensor: only page 0 needs data (one page = Nhkv * Ptkv * Ndkv f16 elements).
         # Because Idx is all zeros every gather access lands on page 0.
-        hbm.write(addrs["X_start_address"], np.zeros(65536, dtype=np.float16))
+        x_page_n_elements = addrs["Nhkv"] * addrs["Ptkv"] * addrs["Ndkv"]
+        hbm.write(addrs["X_start_address"], np.zeros(x_page_n_elements, dtype=np.float16))
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name)
 
