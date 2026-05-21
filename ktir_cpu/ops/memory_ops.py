@@ -97,12 +97,21 @@ class _MemAccessor:
     def read_scattered(
         self, byte_addresses: List[int], dtype: str,
     ) -> Tuple[np.ndarray, Optional[int]]:
-        """Per-element scatter read; returns ``(values, unique_sticks)``.
+        """Run-batched scatter read; returns ``(values, unique_sticks)``.
 
-        Issues one ``self._sim.read(addr, 1, dtype)`` per unique address
-        (set-deduped), then assembles ``values`` in the caller's order.
+        Sorts unique addresses (set-deduped) and merges adjacent ones
+        (``diff == bpe``) into contiguous runs. Each run becomes a single
+        ``self._sim.read(start, len(run), dtype)`` call — one DMA
+        descriptor's worth, matching real hardware behavior. Values are
+        then assembled in the caller's order.
+
         ``unique_sticks`` comes from :meth:`count_sticks` over
         ``byte_addresses`` (HBM: ``int``; LX: ``None``).
+
+        Number of ``sim.read`` calls = run count, bounded by
+        ``unique_sticks`` (HBM) or by ``len(set(byte_addresses))`` (LX).
+        Best case (dense access) collapses to ``1`` call; worst case
+        (fully scattered) issues one call per unique address.
 
         Reads are addressed by elements of ``byte_addresses`` directly;
         the accessor's ``byte_addr`` (used by :meth:`read`) is unused on
@@ -117,13 +126,28 @@ class _MemAccessor:
             raise ValueError("read_scattered called with empty address list")
         unique_sticks = type(self).count_sticks(self._memory_space, byte_addresses)
         np_dtype = _to_np_dtype(dtype)
-        cache: Dict[int, Any] = {}
-        for a in set(byte_addresses):
-            if self.stick_bytes is not None:
-                stick, intra = divmod(a, self.stick_bytes)
-                cache[a] = self._sim.read(stick, 1, dtype, intra_byte=intra)[0]
+        bpe = _bytes_per_elem(dtype)
+
+        sorted_unique = sorted(set(byte_addresses))
+        runs: List[List[int]] = [[sorted_unique[0]]]
+        for a in sorted_unique[1:]:
+            if a - runs[-1][-1] == bpe:
+                runs[-1].append(a)
             else:
-                cache[a] = self._sim.read(a, 1, dtype)[0]
+                runs.append([a])
+
+        cache: Dict[int, Any] = {}
+        for run in runs:
+            start = run[0]
+            n = len(run)
+            if self.stick_bytes is not None:
+                stick, intra = divmod(start, self.stick_bytes)
+                block = self._sim.read(stick, n, dtype, intra_byte=intra)
+            else:
+                block = self._sim.read(start, n, dtype)
+            for i, addr in enumerate(run):
+                cache[addr] = block[i]
+
         values = np.fromiter(
             (cache[a] for a in byte_addresses), dtype=np_dtype,
             count=len(byte_addresses),
@@ -156,10 +180,10 @@ def _resolve_idx_reads(
       traffic" answer, so the function returns the integer directly.
 
     Performance note: per-view loop-invariants (``bpe``, ``strides``,
-    ``byte_address``) are hoisted out of the pt loop. With the
-    per-element ``read_scattered``, paged-attention-scale IATs (millions
-    of points) would otherwise pay function-call + bpe-lookup overhead
-    on each enumerated point.
+    ``byte_address``) are hoisted out of the pt loop. At
+    paged-attention scale (millions of points) the inner loop would
+    otherwise pay function-call + bpe-lookup overhead on each
+    enumerated point.
 
     This is the canonical idx-side resolver: ``indirect_load`` and
     ``indirect_store`` both call it so their stick accounting stays in
@@ -253,46 +277,6 @@ def _build_indirect_coords(
                 raise ValueError(f"Unknown indirect subscript kind: {kind}")
         coords.append(tuple(coord))
     return coords
-
-
-def _idx_unique_sticks_no_reads(iat: "IndirectAccessTile") -> int:
-    """Total HBM sticks an IAT's idx-side reads would touch — without reading.
-
-    Mirrors the stick-counting half of :func:`_resolve_idx_reads` without
-    issuing any simulator reads. Used by latency evaluation paths that
-    lack a result Tile to read ``index_unique_sticks`` from (e.g.
-    ``ktdp.store`` with an indirect access tile).
-
-    Returns ``0`` when every idx view lives in LX (LX has no stick
-    concept). Stick counting itself is delegated to
-    :meth:`_MemAccessor.count_sticks` so this function holds zero
-    knowledge of ``STICK_BYTES``.
-
-    Per-view loop-invariants (``bpe``, ``strides``, ``byte_address``)
-    are hoisted out of the pt loop to mirror ``_resolve_idx_reads``'s
-    paged-attention-friendly iteration shape.
-    """
-    points = iat.variables_space_set.enumerate(iat.shape)
-    total = 0
-    for sub in iat.dim_subscripts:
-        if sub.get("kind") != "indirect":
-            continue
-        iv = iat.index_views[sub["index_view_idx"]]
-        bpe = _bytes_per_elem(iv.dtype)
-        strides = list(iv.strides)
-        base = iv.byte_address
-        idx_exprs = sub["idx_exprs"]
-        addrs = [
-            base + bpe * sum(
-                eval_subscript_expr(e, pt) * s
-                for e, s in zip(idx_exprs, strides)
-            )
-            for pt in points
-        ]
-        sticks = _MemAccessor.count_sticks(iv.memory_space, addrs)
-        if sticks is not None:
-            total += sticks
-    return total
 
 
 class MemoryOps:
@@ -511,7 +495,7 @@ class MemoryOps:
         tile: Tile,
         tile_ref: TileRef,
         coords: Optional[List[Tuple[int, ...]]] = None,
-    ):
+    ) -> int:
         """Store tile data to HBM or LX.
 
         - HBM target → DMA write from LX to HBM.
@@ -535,22 +519,42 @@ class MemoryOps:
             tile: Tile value (tensor data) to store
             tile_ref: Tile reference (memref) describing destination
             coords: Optional list of local coordinate tuples to scatter into.
+
+        Returns:
+            ``unique_sticks`` (int) — the number of distinct 128-byte HBM
+            sticks the write touches. ``0`` for LX destinations (no stick
+            concept; LX HBM traffic is zero by definition). The dialect
+            handler returns this value so :meth:`LatencyTracker._data_size`
+            charges HBM traffic at stick granularity
+            (``unique_sticks * STICK_BYTES``) instead of the source tile's
+            logical ``nbytes``, which would undercount scatter writes.
         """
         mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
+        stick_bytes = mgr.stick_bytes
 
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
             mgr.write(tile.data.flatten())
-            return
+            if not stick_bytes:
+                return 0
+            n = int(np.prod(tile_ref.shape))
+            bpe = _bytes_per_elem(tile_ref.dtype)
+            end = tile_ref.base_ptr + n * bpe
+            return (
+                (end + stick_bytes - 1) // stick_bytes
+                - tile_ref.base_ptr // stick_bytes
+            )
 
         # Strided or coord-set path: read-modify-write via scatter offsets.
-        offsets, _ = MemoryOps._flat_memory_offsets(
-            tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype, coords
+        offsets, unique_sticks = MemoryOps._flat_memory_offsets(
+            tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
+            coords, stick_bytes=stick_bytes,
         )
         span = max(offsets) + 1 if offsets else 1
         flat = mgr.read(span, tile_ref.dtype)
         flat[offsets] = tile.data.flatten()
         mgr.write(flat)
+        return unique_sticks if unique_sticks is not None else 0
 
     @staticmethod
     def indirect_load(
@@ -799,7 +803,7 @@ class MemoryOps:
         context: CoreContext,
         tile: Tile,
         dist_tile_ref: DistributedTileRef,
-    ) -> None:
+    ) -> int:
         """Scatter a tile to surviving partitions, symmetric to :meth:`distributed_load`.
 
         Fast path (BoxSet C_i): slice the source tile rectangularly at
@@ -809,10 +813,18 @@ class MemoryOps:
 
         Slow path (List[Tuple] C_i): per-coord gather/write via one
         read-modify-write.
+
+        Returns:
+            Sum of ``unique_sticks`` across all surviving HBM partitions
+            (``0`` when every partition lives in LX). Mirrors
+            :meth:`distributed_load`'s ``total_unique_sticks`` aggregation
+            so :meth:`LatencyTracker._data_size` charges HBM at stick
+            granularity instead of the source tile's ``nbytes``.
         """
         x = dist_tile_ref.global_base or (0,) * len(dist_tile_ref.shape)
         ndim = len(dist_tile_ref.shape)
 
+        total_unique_sticks = 0
         for survivor in dist_tile_ref.partitions:
             cs = survivor.coordinate_set
             if isinstance(cs, BoxSet):
@@ -822,7 +834,7 @@ class MemoryOps:
                 )
                 src = np.ascontiguousarray(tile.data[slc])
                 sub_tile = Tile(src, survivor.dtype, src.shape)
-                MemoryOps.store(context, sub_tile, sub)
+                total_unique_sticks += MemoryOps.store(context, sub_tile, sub)
                 continue
 
             C_i = cs or []
@@ -834,22 +846,26 @@ class MemoryOps:
                 tuple(c[d] - x[d] for d in range(ndim)) for c in C_i
             ]
             mgr = _MemAccessor(context, survivor.memref.memory_space, survivor.base_ptr, survivor.memref.lx_core_id)
-            offsets, _ = MemoryOps._flat_memory_offsets(
+            offsets, unique_sticks = MemoryOps._flat_memory_offsets(
                 survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
-                local_coords,
+                local_coords, stick_bytes=mgr.stick_bytes,
             )
             span = max(offsets) + 1 if offsets else 1
             flat = mgr.read(span, survivor.dtype)
             for ac, off in zip(access_coords, offsets):
                 flat[off] = tile.data[ac]
             mgr.write(flat)
+            if unique_sticks is not None:
+                total_unique_sticks += unique_sticks
+
+        return total_unique_sticks
 
     @staticmethod
     def indirect_store(
         context: CoreContext,
         tile: Tile,
         iat: "IndirectAccessTile",
-    ) -> None:
+    ) -> int:
         """Store data using an indirect access tile (scatter pattern).
 
         Mirror of :meth:`indirect_load`. Enumerates the variable space,
@@ -860,6 +876,16 @@ class MemoryOps:
         Coordinate collisions (multiple source elements mapping to the same
         destination coordinate) are *implementation-defined*; the current
         behavior is last-writer-wins via NumPy fancy-index assignment.
+
+        Returns:
+            Total ``unique_sticks`` touched on HBM — sum of the parent
+            tile's destination sticks (from :meth:`store`) and the
+            idx-side sticks (from :func:`_resolve_idx_reads`). ``0`` when
+            both the parent and every idx view live in LX (no HBM
+            traffic). Returned via the dialect handler as the op result
+            so :meth:`LatencyTracker._data_size` can charge stick-granular
+            HBM cost — guard symmetry with :meth:`indirect_load`, which
+            stamps the same totals on the result Tile.
         """
         # MLIR type system should already enforce shape match; raise here so a
         # mismatch surfaces clearly instead of as an opaque NumPy shape error.
@@ -876,11 +902,12 @@ class MemoryOps:
                 "variables_space_order is not yet implemented"
             )
 
-        # Resolve every idx-tensor read up front (mirror of indirect_load).
-        # Stick count is discarded here — ``_data_size`` recomputes it from
-        # the IAT for store ops because there is no result Tile to carry
-        # ``index_unique_sticks``.
-        idx_values, _ = _resolve_idx_reads(context, iat)
+        # Resolve idx reads (returns idx_unique_sticks: int, 0 for all-LX
+        # views) and delegate the data write to MemoryOps.store (returns
+        # int: HBM stick count, 0 for LX).
+        idx_values, idx_unique_sticks = _resolve_idx_reads(context, iat)
         coords = _build_indirect_coords(iat, idx_values)
-
-        MemoryOps.store(context, tile, iat.parent_ref.to_tile_ref(), coords=coords)
+        data_sticks = MemoryOps.store(
+            context, tile, iat.parent_ref.to_tile_ref(), coords=coords,
+        )
+        return data_sticks + idx_unique_sticks

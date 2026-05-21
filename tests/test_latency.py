@@ -878,105 +878,6 @@ class TestIndirectAccessLatency:
         with pytest.raises(ValueError, match="empty address list"):
             accessor.read_scattered([], "i32")
 
-    def test_idx_unique_sticks_no_reads_dedups_repeated_coords(self):
-        """_idx_unique_sticks_no_reads dedups across vss-enumerated points.
-
-        Models a paged-attention-shape access pattern in miniature: a
-        2-D variable space ``(d0, d1)`` where ``idx_exprs = (d0,)``
-        projects out ``d1`` entirely.  Each idx coord (d0=0, d0=1) is
-        looked up |range(d1)| = 4 times — but they live on the same
-        stick (i32 idx, base_ptr=0, addresses 0 and 4 both fall in
-        stick 0 of a 128-byte stick).
-
-        Expected: 1 unique stick (despite 8 enumerated points).
-        """
-        from ktir_cpu.ir_types import IndirectAccessTile, MemRef
-        from ktir_cpu.ops.memory_ops import _idx_unique_sticks_no_reads
-        from ktir_cpu.parser_ast import parse_affine_set
-
-        idx_view = MemRef(
-            base_ptr=0, shape=(64,), strides=[1],
-            memory_space="HBM", dtype="i32",  # bpe=4
-        )
-        iat = IndirectAccessTile(
-            parent_ref=idx_view, shape=(2, 4),
-            dim_subscripts=[
-                {"kind": "indirect", "index_view_idx": 0,
-                 "idx_exprs": [("dim", 0)]},
-            ],
-            index_views=[idx_view],
-            variables_space_set=parse_affine_set(
-                "(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 3 >= 0)"
-            ),
-            variables_space_order=None,
-        )
-
-        assert _idx_unique_sticks_no_reads(iat) == 1
-
-    def test_idx_unique_sticks_no_reads_n_distinct_sticks(self):
-        """_idx_unique_sticks_no_reads counts N sticks when each idx coord
-        owns its own stick.
-
-        ``idx_view`` is i32 with one element per stick (stride forces each
-        coord onto a distinct stick).  Enumerating 4 distinct d0 values
-        therefore gives 4 unique sticks.
-        """
-        from ktir_cpu.ir_types import IndirectAccessTile, MemRef
-        from ktir_cpu.ops.memory_ops import _idx_unique_sticks_no_reads
-        from ktir_cpu.parser_ast import parse_affine_set
-
-        # i32 with stride 32 means each idx element is 32 * 4 = 128 bytes
-        # apart — one stick per element.
-        idx_view = MemRef(
-            base_ptr=0, shape=(128,), strides=[32],
-            memory_space="HBM", dtype="i32",
-        )
-        iat = IndirectAccessTile(
-            parent_ref=idx_view, shape=(4,),
-            dim_subscripts=[
-                {"kind": "indirect", "index_view_idx": 0,
-                 "idx_exprs": [("dim", 0)]},
-            ],
-            index_views=[idx_view],
-            variables_space_set=parse_affine_set(
-                "(d0) : (d0 >= 0, -d0 + 3 >= 0)"
-            ),
-            variables_space_order=None,
-        )
-
-        assert _idx_unique_sticks_no_reads(iat) == 4
-
-    def test_idx_unique_sticks_no_reads_returns_zero_for_lx_only_iat(self):
-        """LX has no stick concept — return 0 (defined "no HBM traffic"), not None.
-
-        Reserving ``None`` for "not computed" lets the gated raise in
-        ``_data_size`` catch handlers that forget to populate the field.
-        An LX-only IAT load is a fully legitimate workflow that must
-        report zero HBM idx-side traffic without tripping the guard.
-        """
-        from ktir_cpu.ir_types import IndirectAccessTile, MemRef
-        from ktir_cpu.ops.memory_ops import _idx_unique_sticks_no_reads
-        from ktir_cpu.parser_ast import parse_affine_set
-
-        idx_view = MemRef(
-            base_ptr=0, shape=(64,), strides=[1],
-            memory_space="LX", dtype="i32",
-        )
-        iat = IndirectAccessTile(
-            parent_ref=idx_view, shape=(4,),
-            dim_subscripts=[
-                {"kind": "indirect", "index_view_idx": 0,
-                 "idx_exprs": [("dim", 0)]},
-            ],
-            index_views=[idx_view],
-            variables_space_set=parse_affine_set(
-                "(d0) : (d0 >= 0, -d0 + 3 >= 0)"
-            ),
-            variables_space_order=None,
-        )
-
-        assert _idx_unique_sticks_no_reads(iat) == 0
-
     # ---------------------------------------------------------------------
     # _MemAccessor.count_sticks — single source of truth for stick counting.
     # ---------------------------------------------------------------------
@@ -1091,6 +992,144 @@ class TestIndirectAccessLatency:
         assert sticks is None
 
     # ---------------------------------------------------------------------
+    # _MemAccessor.read_scattered — contiguous-run batching.
+    #
+    # Runs are formed by sorting the unique addresses and merging any pair
+    # whose diff equals ``bpe`` (one element apart in the access dtype).
+    # Each run becomes one ``sim.read(start, n=run_len, dtype, intra_byte)``
+    # call, which models a single DMA descriptor. Number of calls = run
+    # count, which equals 1 for fully dense access and ``unique_sticks``
+    # in the worst case (every address isolated by a gap).
+    # ---------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "addrs,expected_call_args",
+        [
+            # Dense within a stick: all four 4-byte gaps, one run of 4.
+            pytest.param(
+                [0, 4, 8, 12],
+                [(0, 4, "i32", 0)],
+                id="dense_within_stick_one_run",
+            ),
+            # Mid-stick start: intra_byte propagated; one run of 3.
+            pytest.param(
+                [4, 8, 12],
+                [(0, 3, "i32", 4)],
+                id="mid_stick_run_intra_byte_propagated",
+            ),
+            # Two pairs of dense addresses, separated by a stick boundary:
+            # ``[0, 4, 128, 132]`` → two runs of 2 (one per stick).
+            pytest.param(
+                [0, 4, 128, 132],
+                [(0, 2, "i32", 0), (1, 2, "i32", 0)],
+                id="scattered_two_runs_of_two",
+            ),
+            # Two isolated points (gap > bpe between them): two runs of 1.
+            pytest.param(
+                [0, 128],
+                [(0, 1, "i32", 0), (1, 1, "i32", 0)],
+                id="two_isolated_points_two_runs",
+            ),
+            # Repeated address: 1 unique → 1 run; values broadcast in caller order.
+            pytest.param(
+                [0, 0, 0],
+                [(0, 1, "i32", 0)],
+                id="repeated_addr_one_run",
+            ),
+            # Non-monotonic input: caller order ``[12, 0]`` resolves via runs
+            # sorted by address, but values reassemble in input order.
+            pytest.param(
+                [12, 0],
+                [(0, 1, "i32", 0), (0, 1, "i32", 12)],
+                id="non_monotonic_input_runs_sorted_values_in_input_order",
+            ),
+            # Run that crosses a stick boundary: addresses ``[124, 128]``
+            # differ by ``bpe`` so they merge; ``intra_byte=124``, ``n=2``
+            # crosses sticks. ``HBMSimulator._read_flat`` handles this
+            # as long as the underlying allocation spans both sticks.
+            pytest.param(
+                [124, 128],
+                [(0, 2, "i32", 124)],
+                id="run_crosses_stick_boundary_one_call",
+            ),
+        ],
+    )
+    def test_read_scattered_run_batching_call_count_and_args(
+        self, addrs, expected_call_args,
+    ):
+        """read_scattered groups adjacent (diff == bpe) addresses into runs.
+
+        Each run is a single ``sim.read(start, n=run_len, dtype, intra_byte)``
+        call — the simulator-side equivalent of one DMA descriptor.
+        Stubs ``ctx.hbm.read`` with a synthetic byte-addressable layout
+        (``value = (byte_address // 4) + 10``) so the run-merging algorithm
+        can be exercised over arbitrary stick spans without setting up a
+        real HBM region. Verifies (a) actual calls match the expected
+        run decomposition (sorted-address order), (b) returned values
+        reassemble in caller's input order, (c) ``unique_sticks``
+        matches set-dedup over ``addr // 128``.
+        """
+        from ktir_cpu.ops.memory_ops import _MemAccessor
+        from unittest.mock import MagicMock
+
+        def fake_read(stick, n, dtype, *, intra_byte=0):
+            base_byte = stick * 128 + intra_byte
+            return np.array(
+                [(base_byte // 4) + 10 + i for i in range(n)],
+                dtype=np.int32,
+            )
+
+        ctx = MagicMock()
+        ctx.hbm.read = MagicMock(side_effect=fake_read)
+        accessor = _MemAccessor(ctx, "HBM", byte_addr=0)
+
+        values, sticks = accessor.read_scattered(addrs, "i32")
+        # Synthetic layout mirrors the stub: caller sees the byte-address
+        # formula directly, so expected values derive from input addrs.
+        assert list(values) == [(a // 4) + 10 for a in addrs]
+        # Stick count: set-deduped over unique stick indices.
+        assert sticks == len({a // 128 for a in addrs})
+        # Run-batching assertion: one sim.read per run, in sorted-address order.
+        actual_calls = [
+            (c.args[0], c.args[1], c.args[2], c.kwargs.get("intra_byte", 0))
+            for c in ctx.hbm.read.call_args_list
+        ]
+        assert actual_calls == expected_call_args
+
+    def test_read_scattered_run_batching_lx_path(self):
+        """LX run-batching: ``sim.read(byte_addr, n, dtype)``, no intra_byte.
+
+        LX has no stick concept (``stick_bytes = None``), so ``run_start``
+        is passed as the byte address directly. Runs still merge by
+        ``diff == bpe``; the test asserts both the call shape and that
+        ``unique_sticks`` is ``None`` (LX semantics from
+        :meth:`_MemAccessor.count_sticks`).
+        """
+        from ktir_cpu.ops.memory_ops import _MemAccessor
+        from unittest.mock import MagicMock
+
+        def fake_read(byte_addr, n, dtype):
+            base = byte_addr // 4
+            return np.array(
+                [10 * (base + i) for i in range(n)], dtype=np.int32,
+            )
+
+        lx = MagicMock()
+        lx.read = MagicMock(side_effect=fake_read)
+        ctx = MagicMock()
+        ctx.get_lx = MagicMock(return_value=lx)
+        accessor = _MemAccessor(ctx, "LX", byte_addr=0, lx_core_id=0)
+
+        # Two runs: [0, 4, 8] (one run of 3) and [16] (one run of 1).
+        values, sticks = accessor.read_scattered([0, 4, 8, 16], "i32")
+        assert list(values) == [0, 10, 20, 40]
+        assert sticks is None
+        assert lx.read.call_args_list == [
+            ((0, 3, "i32"),),
+            ((16, 1, "i32"),),
+        ]
+
+    # ---------------------------------------------------------------------
     # _data_size — gated raise enforces the IAT-load contract.
     # ---------------------------------------------------------------------
 
@@ -1134,28 +1173,27 @@ class TestIndirectAccessLatency:
             LatencyTracker._data_size(result, [iat])
 
     # ---------------------------------------------------------------------
-    # Guard symmetry — indirect_store charges idx sticks via _data_size's
-    # IAT-operand fallback, mirroring the indirect_load load-side charge.
+    # Store sideband — _data_size charges HBM bytes from the int sideband
+    # returned by MemoryOps.{store, indirect_store, distributed_store}.
+    # The handler propagates that int as the op result; loads still
+    # carry stick counts on the result Tile (guard symmetry).
     # ---------------------------------------------------------------------
 
-    def test_data_size_indirect_store_charges_idx_sticks(self):
-        """Store path: _data_size recomputes idx sticks from the IAT (no result Tile).
+    def test_data_size_int_sideband_charges_stick_bytes(self):
+        """Store path: int result is the unique-stick total; _data_size
+        returns ``result * STICK_BYTES`` regardless of operands.
 
-        ``ktdp.store`` with an indirect access tile has ``result=None``,
-        so the IAT-operand branch in :meth:`LatencyTracker._data_size`
-        falls through to :func:`_idx_unique_sticks_no_reads` rather
-        than reading ``result.index_unique_sticks`` (which doesn't
-        exist). Mirrors the load-side charge for guard symmetry.
-
-        The IAT here enumerates 4 distinct d0 values; idx_view stride
-        forces each onto its own stick → 4 unique sticks → 4 * 128 bytes.
+        The sideband int (returned by ``MemoryOps.indirect_store`` for
+        IATs, or ``MemoryOps.store`` for direct stores) already
+        aggregates both data sticks (destination) and idx sticks (IAT).
+        Operands are therefore ignored by the int branch — this asserts
+        the absence of the pre-fix double-charge that fell through to
+        ``v.data.nbytes`` for the source Tile.
         """
         from ktir_cpu.ir_types import IndirectAccessTile, MemRef, Tile
         from ktir_cpu.latency import LatencyTracker
         from ktir_cpu.parser_ast import parse_affine_set
 
-        # i32 stride 32 → each idx element is 32 * 4 = 128 bytes apart,
-        # one stick per element.
         idx_view = MemRef(
             base_ptr=0, shape=(128,), strides=[32],
             memory_space="HBM", dtype="i32",
@@ -1172,15 +1210,191 @@ class TestIndirectAccessLatency:
             ),
             variables_space_order=None,
         )
-        # Store source tile lands as the second branch's Tile operand;
-        # we only care that the IAT operand branch contributes its idx
-        # sticks. The store source contributes its data.nbytes.
         src = Tile(np.zeros(4, dtype=np.float16), "f16", (4,))
 
-        # result=None (store), operands=[iat, src]:
-        #   IAT branch (store path) → 4 sticks * 128 = 512
-        #   Tile branch (src)       → src.data.nbytes = 8
-        assert LatencyTracker._data_size(None, [iat, src]) == 4 * 128 + 8
+        # result=4 (sideband: total unique sticks for this store);
+        # operands=[iat, src] are ignored on the int branch.
+        assert LatencyTracker._data_size(4, [iat, src]) == 4 * 128
+
+    def test_data_size_int_sideband_direct_store_64x64_scatter(self):
+        """C3 regression: stick-granular accounting beats source.nbytes for scatters.
+
+        Before the sideband fix, ``_data_size`` charged direct stores at
+        ``v.data.nbytes`` — the source tile's logical size, blind to
+        scatter pattern. For a 64×64 f16 tile (8192 bytes) scattered to
+        100 distinct sticks, the real HBM traffic is ``100 * 128 = 12800``
+        bytes (HBM is stick-addressed; partial stick writes still cost
+        the full 128 bytes). The pre-fix path undercounted by 4608 bytes.
+
+        With the sideband, the int (``unique_sticks=100``) carries the
+        correct stick count; ``_data_size`` returns ``100 * 128``.
+        """
+        from ktir_cpu.latency import LatencyTracker
+
+        assert LatencyTracker._data_size(100, []) == 100 * 128
+        assert 100 * 128 != 64 * 64 * 2  # the bug magnitude is non-trivial
+
+    def test_data_size_rejects_tile_operand_with_none_result(self):
+        """Tile operand + None result trips the guard — was the pre-fix bug.
+
+        Pre-sideband, ``_data_size`` fell back to ``v.data.nbytes`` for
+        the source Tile of a store, undercounting any non-stick-aligned
+        scatter. The new contract: store handlers must propagate
+        ``MemoryOps.store``'s int return. A None result with a Tile
+        operand now raises rather than silently using nbytes.
+        """
+        from ktir_cpu.ir_types import Tile
+        from ktir_cpu.latency import LatencyTracker
+
+        src = Tile(np.zeros(4, dtype=np.float16), "f16", (4,))
+
+        with pytest.raises(RuntimeError, match="propagate MemoryOps.store"):
+            LatencyTracker._data_size(None, [src])
+
+    def test_data_size_rejects_iat_operand_with_none_result(self):
+        """IAT operand + None result trips the guard — store sideband must fire.
+
+        Pre-sideband, the IAT-operand branch fell back to
+        ``_idx_unique_sticks_no_reads(v) * STICK_BYTES``. The new
+        contract: indirect-store handlers must propagate
+        ``MemoryOps.indirect_store``'s int return. A None result with
+        an IAT operand now raises.
+        """
+        from ktir_cpu.ir_types import IndirectAccessTile, MemRef
+        from ktir_cpu.latency import LatencyTracker
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        idx_view = MemRef(
+            base_ptr=0, shape=(4,), strides=[1],
+            memory_space="HBM", dtype="i32",
+        )
+        iat = IndirectAccessTile(
+            parent_ref=idx_view, shape=(4,),
+            dim_subscripts=[
+                {"kind": "indirect", "index_view_idx": 0,
+                 "idx_exprs": [("dim", 0)]},
+            ],
+            index_views=[idx_view],
+            variables_space_set=parse_affine_set(
+                "(d0) : (d0 >= 0, -d0 + 3 >= 0)"
+            ),
+            variables_space_order=None,
+        )
+
+        with pytest.raises(RuntimeError, match="without int sideband"):
+            LatencyTracker._data_size(None, [iat])
+
+    # ---------------------------------------------------------------------
+    # LX stores: the sideband int is 0 (no HBM stick concept), and
+    # _data_size charges 0 bytes. These guard against the rejects-tests
+    # above accidentally over-firing on legitimate LX paths — store
+    # handlers must always return an int, never None.
+    # ---------------------------------------------------------------------
+
+    def test_store_returns_zero_for_lx_destination(self):
+        """``MemoryOps.store`` to an LX tile returns ``0``, not ``None``.
+
+        LX has no stick concept, so HBM stick traffic is 0 by definition.
+        The handler propagates that 0 as the op result; ``_data_size``'s
+        int branch fires with ``0 * STICK_BYTES = 0``. Returning ``None``
+        instead would trip ``test_data_size_rejects_tile_operand_with_none_result``
+        on every LX store path.
+        """
+        from ktir_cpu.grid import CoreContext
+        from ktir_cpu.ir_types import MemRef, Tile
+        from ktir_cpu.memory import HBMSimulator, LXScratchpad
+        from ktir_cpu.ops.memory_ops import MemoryOps
+
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                          lx=LXScratchpad(core_id=0), hbm=HBMSimulator())
+        tile_ref = MemRef(
+            base_ptr=0, shape=(4,), strides=[1],
+            memory_space="LX", dtype="f16",
+        ).to_tile_ref()
+        src = Tile(np.arange(4, dtype=np.float16), "f16", (4,))
+
+        result = MemoryOps.store(ctx, src, tile_ref)
+        assert result == 0
+        assert isinstance(result, int)  # not None
+
+    def test_indirect_store_returns_zero_for_all_lx(self):
+        """``MemoryOps.indirect_store`` returns ``0`` when parent + every
+        idx view live in LX (no HBM traffic on either side).
+        """
+        from ktir_cpu.grid import CoreContext
+        from ktir_cpu.ir_types import IndirectAccessTile, MemRef, Tile
+        from ktir_cpu.memory import HBMSimulator, LXScratchpad
+        from ktir_cpu.ops.memory_ops import MemoryOps
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        lx = LXScratchpad(core_id=0)
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0), lx=lx, hbm=HBMSimulator())
+
+        parent_ptr = 0
+        idx_ptr = 64  # past parent's 8 f16 = 16 bytes; safe non-overlap
+        lx.write(parent_ptr, np.zeros(8, dtype=np.float16))  # seed for read-modify-write
+        lx.write(idx_ptr, np.arange(4, dtype=np.int32))
+
+        parent_ref = MemRef(
+            base_ptr=parent_ptr, shape=(8,), strides=[1],
+            memory_space="LX", dtype="f16",
+        )
+        idx_view = MemRef(
+            base_ptr=idx_ptr, shape=(4,), strides=[1],
+            memory_space="LX", dtype="i32",
+        )
+        iat = IndirectAccessTile(
+            parent_ref=parent_ref, shape=(4,),
+            dim_subscripts=[
+                {"kind": "indirect", "index_view_idx": 0,
+                 "idx_exprs": [("dim", 0)]},
+            ],
+            index_views=[idx_view],
+            variables_space_set=parse_affine_set(
+                "(d0) : (d0 >= 0, -d0 + 3 >= 0)"
+            ),
+            variables_space_order=None,
+        )
+        src = Tile(np.arange(4, dtype=np.float16), "f16", (4,))
+
+        result = MemoryOps.indirect_store(ctx, src, iat)
+        assert result == 0
+        assert isinstance(result, int)
+
+    def test_distributed_store_returns_zero_for_all_lx(self):
+        """``MemoryOps.distributed_store`` returns ``0`` when every
+        surviving partition lives in LX. Mirrors the all-HBM aggregation
+        path but with the LX sentinel (0 sticks per survivor).
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.grid import CoreContext
+        from ktir_cpu.ir_types import (
+            DistributedTileRef, MemRef, Tile, TileRef,
+        )
+        from ktir_cpu.memory import HBMSimulator, LXScratchpad
+        from ktir_cpu.ops.memory_ops import MemoryOps
+
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                          lx=LXScratchpad(core_id=0), hbm=HBMSimulator())
+
+        ptr = 0
+        memref = MemRef(
+            base_ptr=ptr, shape=(8,), strides=[1],
+            memory_space="LX", dtype="f16",
+        )
+        survivor = TileRef(
+            base_ptr=ptr, shape=(8,), strides=[1], memref=memref, dtype="f16",
+            coordinate_set=BoxSet(lo=(0,), hi=(8,)),
+            partition_origin=(0,),
+        )
+        dist_ref = DistributedTileRef(
+            partitions=[survivor], shape=(8,), dtype="f16", global_base=(0,),
+        )
+        src = Tile(np.arange(8, dtype=np.float16), "f16", (8,))
+
+        result = MemoryOps.distributed_store(ctx, src, dist_ref)
+        assert result == 0
+        assert isinstance(result, int)
 
     # ---------------------------------------------------------------------
     # End-to-end: MemoryOps.indirect_load / .indirect_store actually stash
@@ -1275,19 +1489,19 @@ class TestIndirectAccessLatency:
         )
 
     def test_indirect_store_index_sticks_mirrors_load(self):
-        """Guard symmetry: indirect_store's idx-side stick count matches indirect_load.
+        """Guard symmetry: indirect_store's idx-side count matches indirect_load.
 
-        Both ops share ``_resolve_idx_reads`` for the runtime read and
-        delegate stick counting to ``_MemAccessor.count_sticks``. The
-        latency model recomputes the store-side count via
-        ``_idx_unique_sticks_no_reads(iat)`` (since stores have no
-        result Tile). Pinning the load value and the no-read value
-        equal locks the symmetry — if either path drifts, this trips.
+        Both ops share ``_resolve_idx_reads`` for the runtime read.
+        ``indirect_load`` stamps idx sticks on ``Tile.index_unique_sticks``;
+        ``indirect_store`` returns the same count (plus data sticks) via
+        the int sideband. Pinning load's idx total against the store's
+        return minus its data sticks locks the symmetry — drift on
+        either path trips this test.
         """
         from ktir_cpu.grid import CoreContext
         from ktir_cpu.ir_types import Tile
         from ktir_cpu.memory import HBMSimulator, LXScratchpad
-        from ktir_cpu.ops.memory_ops import MemoryOps, _idx_unique_sticks_no_reads
+        from ktir_cpu.ops.memory_ops import MemoryOps
 
         hbm = HBMSimulator()
         lx = LXScratchpad(size_mb=2, core_id=0)
@@ -1296,20 +1510,17 @@ class TestIndirectAccessLatency:
         iat = self._build_simple_gather_iat(hbm)
 
         load_result = MemoryOps.indirect_load(ctx, iat)
-        load_sticks = load_result.index_unique_sticks
+        load_idx_sticks = load_result.index_unique_sticks
+        load_data_sticks = load_result.unique_sticks
 
-        # Store side: _data_size goes through _idx_unique_sticks_no_reads,
-        # which is the no-IO mirror of _resolve_idx_reads' stick count.
-        store_sticks = _idx_unique_sticks_no_reads(iat)
-
-        assert load_sticks == store_sticks == 4, (
-            f"load idx sticks={load_sticks}, store idx sticks={store_sticks}, "
-            f"expected both to be 4"
-        )
-
-        # Smoke-test the actual store call (does it execute, does it
-        # leave HBM in a consistent state). Source is i32 zeros sized
-        # to match the IAT shape; we already seeded X to zeros so the
-        # store is effectively a no-op write.
+        # Store side: returned int = data_sticks + idx_sticks. Subtract
+        # data_sticks (1 stick: 8×8 f16 = 128 bytes = 1 stick) to recover
+        # the idx-side count and assert symmetry against the load.
         src_tile = Tile(np.zeros((8, 8), dtype=np.float16), "f16", (8, 8))
-        MemoryOps.indirect_store(ctx, src_tile, iat)
+        store_total_sticks = MemoryOps.indirect_store(ctx, src_tile, iat)
+        store_idx_sticks = store_total_sticks - load_data_sticks
+
+        assert load_idx_sticks == store_idx_sticks == 4, (
+            f"load idx sticks={load_idx_sticks}, "
+            f"store idx sticks={store_idx_sticks}, expected both to be 4"
+        )
