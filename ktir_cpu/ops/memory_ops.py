@@ -115,12 +115,20 @@ class _MemAccessor:
 
         Reads are addressed by elements of ``byte_addresses`` directly;
         the accessor's ``byte_addr`` (used by :meth:`read`) is unused on
-        this path. Full migration to a tuple-returning ``read()`` is a
-        follow-up.
+        this path.
 
         Raises ``ValueError`` on empty ``byte_addresses`` — empty is
         ambiguous in a read context (zero-traffic vs caller bug); use
         :meth:`count_sticks` directly for the pure query.
+
+        Caller invariant: all ``byte_addresses`` must lie within a single
+        HBM allocation. Cross-allocation calls are silently wrong —
+        physically-adjacent addresses from two allocations merge into one
+        run, and ``HBMSimulator._read_flat`` reads only the allocation
+        containing the run's start address, zero-filling the rest instead
+        of reading from the second allocation. No error is raised.
+        Hard-guarding this requires the simulator to expose allocation
+        extent; tracked as a follow-up.
         """
         if not byte_addresses:
             raise ValueError("read_scattered called with empty address list")
@@ -129,6 +137,7 @@ class _MemAccessor:
         bpe = _bytes_per_elem(dtype)
 
         sorted_unique = sorted(set(byte_addresses))
+        # sorted_unique non-empty: byte_addresses guarded above.
         runs: List[List[int]] = [[sorted_unique[0]]]
         for a in sorted_unique[1:]:
             if a - runs[-1][-1] == bpe:
@@ -179,11 +188,8 @@ def _resolve_idx_reads(
       special-case it, and the LX-only case is a defined "zero HBM
       traffic" answer, so the function returns the integer directly.
 
-    Performance note: per-view loop-invariants (``bpe``, ``strides``,
-    ``byte_address``) are hoisted out of the pt loop. At
-    paged-attention scale (millions of points) the inner loop would
-    otherwise pay function-call + bpe-lookup overhead on each
-    enumerated point.
+    Per-view loop-invariants (``bpe``, ``strides``, ``byte_address``)
+    are hoisted out of the pt loop for million-point scale.
 
     This is the canonical idx-side resolver: ``indirect_load`` and
     ``indirect_store`` both call it so their stick accounting stays in
@@ -218,6 +224,11 @@ def _resolve_idx_reads(
     per_view_values: Dict[int, np.ndarray] = {}
     total_sticks = 0
     for iv_idx, addrs in per_view_addrs.items():
+        # Zero-extent enumeration: no points, no addresses, no read.
+        # _build_indirect_coords iterates the same enumeration, so it
+        # also produces zero coords and never consumes from this view.
+        if not addrs:
+            continue
         idx_view = iat.index_views[iv_idx]
         accessor = _MemAccessor(
             context, idx_view.memory_space, idx_view.byte_address,

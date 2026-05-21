@@ -308,20 +308,17 @@ class LatencyTracker:
 
         total = 0
         if isinstance(result, Tile):
-            if result.unique_sticks is not None:
-                total += result.unique_sticks * HBMSimulator.STICK_BYTES
-            else:
-                total += result.data.nbytes
+            if result.unique_sticks is None:
+                raise RuntimeError(
+                    "Tile result on HBM path must populate unique_sticks; "
+                    "got None. Load handlers must set unique_sticks for "
+                    "stick-granular HBM accounting."
+                )
+            total += result.unique_sticks * HBMSimulator.STICK_BYTES
             if result.index_unique_sticks is not None:
                 total += result.index_unique_sticks * HBMSimulator.STICK_BYTES
         for v in operands:
             if isinstance(v, IndirectAccessTile):
-                # Only the load path reaches here — store ops returned
-                # via the int sideband above. The IAT-load contract
-                # requires the handler to set ``index_unique_sticks`` to
-                # an integer (0 for an all-LX IAT, positive for HBM); a
-                # surviving None means the handler skipped
-                # ``_resolve_idx_reads``, which would silently undercount.
                 if not isinstance(result, Tile):
                     raise RuntimeError(
                         "IAT operand without Tile result and without int "
@@ -342,12 +339,6 @@ class LatencyTracker:
                         f"_data_size: Tile in operands but result is also "
                         f"{type(result).__name__}; no ktdp op should produce both"
                     )
-                # Tile-operand-without-result reaches here only if a memory
-                # op handler returned None instead of the int from its
-                # underlying MemoryOps call. Reject rather than fall back
-                # to v.data.nbytes — the source tile's logical size is not
-                # a valid proxy for HBM traffic on a stick-addressed bus
-                # (would undercount any non-stick-aligned scatter).
                 raise RuntimeError(
                     "Tile operand with None result: store handler must "
                     "propagate MemoryOps.store's int return as op result "

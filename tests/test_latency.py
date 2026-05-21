@@ -577,8 +577,11 @@ class TestLatencyEdgeCases:
         cfg = HardwareConfig()
         tracker = LatencyTracker(cfg)
 
-        # A zero-element tile (e.g. empty slice)
-        zero_tile = Tile(np.array([], dtype=np.float16), "f16", (0,))
+        # A zero-element tile (e.g. empty slice). unique_sticks=0 honors
+        # the HBM-load contract: a zero-element load spans zero sticks.
+        zero_tile = Tile(
+            np.array([], dtype=np.float16), "f16", (0,), unique_sticks=0,
+        )
         assert zero_tile.size_bytes() == 0
 
         # _data_size should return 0 for a zero-element result
@@ -610,12 +613,18 @@ class TestLatencyEdgeCases:
             index_views=[lx_idx, lx_idx],
             variables_space_set=vss, variables_space_order=None,
         )
+        # 4x4 f16 = 32 bytes — fits within one 128-byte stick.
+        # index_unique_sticks=0 honors the IAT-load contract for an
+        # all-LX IAT (LX has no stick concept).
         result = Tile(
             np.zeros((4, 4), dtype=np.float16), "f16", (4, 4),
+            unique_sticks=1,
             index_unique_sticks=0,
         )
 
-        assert LatencyTracker._data_size(result, [iat]) == result.data.nbytes
+        # Data side: 1 stick * 128 bytes. Idx side: 0 (all-LX index views
+        # contribute nothing). Total stays stick-granular, not data.nbytes.
+        assert LatencyTracker._data_size(result, [iat]) == 1 * 128
         assert LatencyTracker._memory_space([iat]) == "HBM"
 
     def test_empty_counters_bottleneck(self):
@@ -958,8 +967,7 @@ class TestIndirectAccessLatency:
     ):
         """read_scattered reads one element per address, returns (values, sticks).
 
-        Verifies the per-element semantics fabian's review required:
-        stick count is set-deduped on the address side regardless of how
+        Stick count is set-deduped on the address side regardless of how
         many physical reads are issued; values are returned in caller
         order. Per-stick formula: ``len({addr // 128 for addr in addrs})``.
         """
@@ -1172,23 +1180,82 @@ class TestIndirectAccessLatency:
         ):
             LatencyTracker._data_size(result, [iat])
 
+    def test_resolve_idx_reads_zero_extent_skips_view(self, monkeypatch):
+        """Zero-extent IAT enumeration: ``_resolve_idx_reads`` returns
+        ``({}, 0)`` rather than calling ``read_scattered([])``.
+
+        A zero-extent dim is a legitimate degenerate case (the
+        enumeration yields no points, hence no addresses to resolve).
+        The view is skipped; ``_build_indirect_coords`` iterates the
+        same enumeration and likewise produces no coords, so the
+        missing key is never consumed.
+        """
+        from ktir_cpu.ir_types import IndirectAccessTile, MemRef
+        from ktir_cpu.ops.memory_ops import _resolve_idx_reads
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+
+        idx_view = MemRef(
+            base_ptr=0, shape=(4,), strides=[1],
+            memory_space="HBM", dtype="i32",
+        )
+        iat = IndirectAccessTile(
+            parent_ref=idx_view, shape=(4,),
+            dim_subscripts=[
+                {"kind": "indirect", "index_view_idx": 0,
+                 "idx_exprs": [("dim", 0)]},
+            ],
+            index_views=[idx_view],
+            # Raw AffineSet (not a BoxSet) so enumerate goes through the
+            # module-level enumerate_affine_set we stub below.
+            variables_space_set=parse_affine_set_raw(
+                "(d0) : (d0 >= 0, -d0 + 3 >= 0)"
+            ),
+            variables_space_order=None,
+        )
+        # Stub the enumerator to an empty list — the legitimate
+        # zero-extent case. context is never accessed: ``continue`` fires
+        # before any ``_MemAccessor`` is constructed.
+        import ktir_cpu.parser_ast as parser_ast
+        monkeypatch.setattr(
+            parser_ast, "enumerate_affine_set", lambda *a, **kw: []
+        )
+        per_view_values, total_sticks = _resolve_idx_reads(None, iat)
+        assert per_view_values == {}
+        assert total_sticks == 0
+
+    def test_data_size_raises_when_tile_result_missing_unique_sticks(self):
+        """Tile result with ``unique_sticks=None`` raises.
+
+        ``_data_size`` is reached only on the HBM path (LX short-circuits
+        before it). On HBM, load handlers must populate ``unique_sticks``;
+        a None here is a handler bug.
+        """
+        from ktir_cpu.ir_types import Tile
+        from ktir_cpu.latency import LatencyTracker
+
+        result = Tile(
+            np.zeros(4, dtype=np.float16), "f16", (4,), unique_sticks=None,
+        )
+
+        with pytest.raises(
+            RuntimeError, match="must populate unique_sticks"
+        ):
+            LatencyTracker._data_size(result, [])
+
     # ---------------------------------------------------------------------
     # Store sideband — _data_size charges HBM bytes from the int sideband
     # returned by MemoryOps.{store, indirect_store, distributed_store}.
-    # The handler propagates that int as the op result; loads still
-    # carry stick counts on the result Tile (guard symmetry).
+    # The handler propagates that int as the op result; loads carry
+    # stick counts on the result Tile (guard symmetry).
     # ---------------------------------------------------------------------
 
     def test_data_size_int_sideband_charges_stick_bytes(self):
-        """Store path: int result is the unique-stick total; _data_size
-        returns ``result * STICK_BYTES`` regardless of operands.
+        """``_data_size`` returns ``result * STICK_BYTES`` for an int result.
 
-        The sideband int (returned by ``MemoryOps.indirect_store`` for
-        IATs, or ``MemoryOps.store`` for direct stores) already
-        aggregates both data sticks (destination) and idx sticks (IAT).
-        Operands are therefore ignored by the int branch — this asserts
-        the absence of the pre-fix double-charge that fell through to
-        ``v.data.nbytes`` for the source Tile.
+        The sideband int (from ``MemoryOps.indirect_store`` for IATs, or
+        ``MemoryOps.store`` for direct stores) already aggregates data
+        sticks (destination) and idx sticks (IAT). Operands are
+        therefore ignored on the int branch.
         """
         from ktir_cpu.ir_types import IndirectAccessTile, MemRef, Tile
         from ktir_cpu.latency import LatencyTracker
@@ -1217,31 +1284,27 @@ class TestIndirectAccessLatency:
         assert LatencyTracker._data_size(4, [iat, src]) == 4 * 128
 
     def test_data_size_int_sideband_direct_store_64x64_scatter(self):
-        """C3 regression: stick-granular accounting beats source.nbytes for scatters.
+        """Direct store cost is stick-granular, not source-tile bytes.
 
-        Before the sideband fix, ``_data_size`` charged direct stores at
-        ``v.data.nbytes`` — the source tile's logical size, blind to
-        scatter pattern. For a 64×64 f16 tile (8192 bytes) scattered to
-        100 distinct sticks, the real HBM traffic is ``100 * 128 = 12800``
-        bytes (HBM is stick-addressed; partial stick writes still cost
-        the full 128 bytes). The pre-fix path undercounted by 4608 bytes.
-
-        With the sideband, the int (``unique_sticks=100``) carries the
-        correct stick count; ``_data_size`` returns ``100 * 128``.
+        For a 64×64 f16 tile (8192 logical bytes) scattered to 100
+        distinct sticks, HBM traffic is ``100 * 128 = 12800`` bytes —
+        HBM is stick-addressed, so a partial-stick write still costs
+        the full 128 bytes. The sideband int (``unique_sticks=100``)
+        carries the stick count; ``_data_size`` returns ``100 * 128``,
+        which differs from ``64 * 64 * 2`` by 4608 bytes.
         """
         from ktir_cpu.latency import LatencyTracker
 
         assert LatencyTracker._data_size(100, []) == 100 * 128
-        assert 100 * 128 != 64 * 64 * 2  # the bug magnitude is non-trivial
+        # Stick-granular cost differs from logical-bytes by a non-trivial margin.
+        assert 100 * 128 != 64 * 64 * 2
 
     def test_data_size_rejects_tile_operand_with_none_result(self):
-        """Tile operand + None result trips the guard — was the pre-fix bug.
+        """Tile operand with None result raises.
 
-        Pre-sideband, ``_data_size`` fell back to ``v.data.nbytes`` for
-        the source Tile of a store, undercounting any non-stick-aligned
-        scatter. The new contract: store handlers must propagate
-        ``MemoryOps.store``'s int return. A None result with a Tile
-        operand now raises rather than silently using nbytes.
+        Store handlers must propagate ``MemoryOps.store``'s int return
+        as the op result; a None result with a Tile operand violates
+        the contract and raises.
         """
         from ktir_cpu.ir_types import Tile
         from ktir_cpu.latency import LatencyTracker
@@ -1252,13 +1315,11 @@ class TestIndirectAccessLatency:
             LatencyTracker._data_size(None, [src])
 
     def test_data_size_rejects_iat_operand_with_none_result(self):
-        """IAT operand + None result trips the guard — store sideband must fire.
+        """IAT operand with None result raises.
 
-        Pre-sideband, the IAT-operand branch fell back to
-        ``_idx_unique_sticks_no_reads(v) * STICK_BYTES``. The new
-        contract: indirect-store handlers must propagate
-        ``MemoryOps.indirect_store``'s int return. A None result with
-        an IAT operand now raises.
+        Indirect-store handlers must propagate
+        ``MemoryOps.indirect_store``'s int return as the op result; a
+        None result with an IAT operand violates the contract and raises.
         """
         from ktir_cpu.ir_types import IndirectAccessTile, MemRef
         from ktir_cpu.latency import LatencyTracker
