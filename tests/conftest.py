@@ -249,6 +249,16 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "execute_kwargs": {},
         },
     ],
+    "distributed_view_copy_dynamic": [
+        {
+            "path": "rfc/distributed-view-copy-dynamic.mlir",
+            # 2 HBM partitions split a logical 64x26 tensor at column s0=13.
+            # s0 drives the symbolic coordinate_set on construct_memory_view
+            # for both partitions; the access tile shape 64x26 covers the
+            # full global domain when 2*s0 = 26.
+            "execute_kwargs": {"s0_in": 13},
+        },
+    ],
     "add": [
         {
             "path": "rfc/add-with-control-flow.mlir",
